@@ -9,6 +9,7 @@ from .exponential_ import exponential_
 from .full import full
 from .full_like import full_like
 from .groupnorm import group_norm
+from .gru import gru, gru_data
 from .hadamard_transform import hadamard_transform
 from .index import index
 from .index_put import index_put, index_put_
@@ -56,6 +57,8 @@ __all__ = [
     "full",
     "full_like",
     "group_norm",
+    "gru",
+    "gru_data",
     "hadamard_transform",
     "index",
     "index_put",

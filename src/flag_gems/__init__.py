@@ -482,6 +482,8 @@ _FULL_CONFIG = (
     ("greater_equal.Tensor", ge),
     ("greater_equal_.Tensor", greater_equal_),
     ("grid_sample", grid_sample),
+    ("gru.input", gru),
+    ("gru.data", gru_data),
     ("gt.Scalar", gt_scalar),
     ("gt.Tensor", gt),
     ("gt_.Scalar", gt_scalar_),
