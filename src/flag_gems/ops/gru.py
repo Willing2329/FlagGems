@@ -4,14 +4,14 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems import runtime
 from flag_gems.ops.dropout import dropout as _dropout
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 
 logger = logging.getLogger(__name__)
 
-# Small recurrent shapes dominate the benchmark suite; keep register use controlled.
-_BLOCK_B = 8
+_BLOCK_B = 16
 _BLOCK_H_MAX = 32
 _BLOCK_K_MAX = 64
 _COPY_BLOCK = 1024
@@ -19,33 +19,18 @@ _COPY_BLOCK = 1024
 _TRANSPOSE_BLOCK = 32
 # Element width for the packed<->padded scatter/gather kernels.
 _PACK_BLOCK = 256
-# batch==1 recurrence is a GEMV (M==1): an FMA matvec. When hidden fits one K tile the
-# weights are hoisted into registers and a tiny output tile (BLOCK_N=2) maximizes
-# occupancy (3.80x -> 2.35x on H20); larger hidden falls back to the split grid.
+# batch==1 is a GEMV (FMA matvec): hoist the weights and use BLOCK_N=2 for occupancy
+# when hidden fits one K tile, otherwise fall back to the split grid.
 _GEMV_BLOCK_N_MAX = 16
 _GEMV_BLOCK_K_MAX = 128
 _GEMV_HOIST_BLOCK_N = 2
 _GEMV_HOIST_NUM_WARPS = 1
-# Input-side GEMM is a non-recurrent matmul over the whole sequence. Its three
-# axes have very different natural sizes (batch is small, 3*hidden is medium,
-# input_size varies), so one hand-picked tile fits poorly across the benchmark
-# suite. Autotune over the (batch, gate, input) tiles instead; the first config
-# is the original hand-tuned choice so autotune can never regress past it. The
-# set is pruned to the axes that actually moved the needle in the sweep: a wider
-# gate tile (BLOCK_N=128) for large 3*hidden, and 32 batch-rows + 8 warps for
-# large batch; BLOCK_K and num_warps beyond those two tiers did not matter.
-_GRU_INPUT_GEMM_CONFIGS = [
-    triton.Config({"BLOCK_B": 16, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_B": 16, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_B": 16, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_B": 32, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_B": 32, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=8, num_stages=2),
-]
-# The grid-barrier kernels (batch==1 GEMV and the persistent recurrence) need every
-# program co-resident or they deadlock. The only bound that is provably co-resident on
-# arbitrary hardware is 1 CTA/SM (a CTA always occupies exactly one SM, so
-# grid <= num_SMs fits by construction); a 2-CTA/SM heuristic can over-estimate real
-# occupancy on a different arch / Triton version and hang. See _max_persistent_programs.
+
+# Per-step recurrence launch config 
+_STEP_BLOCK_H = 64
+_STEP_BLOCK_K = 32
+_STEP_NUM_WARPS = 4
+_STEP_NUM_STAGES = 2
 
 
 @libentry()
@@ -110,9 +95,7 @@ def _transpose_weight_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    # Transpose (rows, cols) -> (cols, rows) so the GEMM B operand's gate dim is
-    # contiguous. Dedicated kernel because contiguous()/clone() hit FlagGems' copy_,
-    # which crashes on transposed views.
+    # Transpose to (cols, rows) so the GEMM B operand's gate dim is contiguous;
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
     offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -221,7 +204,7 @@ def _pack_output_kernel(
 
 @libentry()
 @triton.autotune(
-    configs=_GRU_INPUT_GEMM_CONFIGS,
+    configs=runtime.get_tuned_config("gru"),
     key=["input_size", "hidden_size", "batch_size"],
 )
 @triton.jit
@@ -250,9 +233,8 @@ def _gru_input_gemm_kernel(
     BLOCK_K: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
 ):
-    # Precompute u[t, b, n] = sum_k x[t,b,k] * W_ih[n,k] + b_ih[n] for all timesteps in
-    # one batched GEMM (n indexes the [r|z|n] gate columns). Order-independent, so one
-    # parallel launch replaces per-step recomputation (cuDNN does the same split).
+    # u[t,b,n] = sum_k x[t,b,k] * W_ih[n,k] + b_ih[n] for all timesteps in one batched
+    # GEMM (n indexes the [r|z|n] gates), replacing per-step recomputation.
     pid_b = tl.program_id(0)
     seq_idx = tl.program_id(1)
     pid_n = tl.program_id(2)
@@ -340,9 +322,8 @@ def _gru_step_kernel(
     COMPUTE_DTYPE: tl.constexpr,
     PACKED: tl.constexpr,
 ):
-    # One recurrence step: input-side pre-activations are already in ``u``, so only
-    # the hidden GEMM + gate combination remain. Gates r (reset), z (update), n
-    # (candidate): n = tanh(u_n + r ⊙ (W_hn h + b_hn)).
+    # One recurrence step: ``u`` already holds the input pre-activations, so only the
+    # hidden GEMM + gates remain. Gates r/z sigmoid, n = tanh(u_n + r * (W_hn h + b_hn)).
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -491,10 +472,8 @@ def _gru_persistent_kernel(
     COMPUTE_DTYPE: tl.constexpr,
     PACKED: tl.constexpr,
 ):
-    # Persistent recurrence: one launch folds the time loop, keeping this program's
-    # (batch, hidden) h tile on-chip. h is double-buffered (2, batch, hidden) so the
-    # h[step-1] read never races h[step] writes; a grid-wide barrier after each step
-    # makes all h writes visible before the next read. Requires a co-resident grid.
+    # Time loop folded into one launch. h is double-buffered so step reads never race
+    # writes; a grid-wide barrier after each step requires a co-resident grid.
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -625,10 +604,8 @@ def _gru_gemv_kernel(
     NUM_PROGRAMS: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
 ):
-    # batch==1 GEMV: a (batch, hidden) dot grid would only fill cdiv(hidden, BLOCK_H)
-    # programs and idle the GPU (~6x slower than cuDNN). Instead each program owns
-    # BLOCK_N hidden outputs across all three gates and reduces K with an element-wise
-    # sum, so the candidate gate still sees the reset gate without a second barrier.
+    # batch==1: a (batch, hidden) dot grid would idle the GPU (~6x slower than cuDNN);
+    # each program owns BLOCK_N outputs, reducing K element-wise so r gates n directly.
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_n < hidden_size
@@ -771,15 +748,7 @@ def _block_size(value: int, maximum: int) -> int:
 
 
 def _max_persistent_programs(device) -> int:
-    """Upper bound on the barrier grid that is provably co-resident, hence deadlock-free.
 
-    A grid-wide spin-wait barrier hangs if any program is not resident. The only bound
-    that holds on every CUDA device is 1 CTA/SM: a CTA always occupies exactly one SM,
-    so grid <= num_SMs means every program is resident from launch. (A program that does
-    not fit an SM fails the launch with an error rather than hanging.) This deliberately
-    steps down from the old 2 CTA/SM register heuristic, which could over-estimate real
-    occupancy on a different GPU arch / Triton version and deadlock.
-    """
     return torch_device_fn.get_device_properties(device).multi_processor_count
 
 
@@ -808,9 +777,8 @@ def _bias_stride(tensor: torch.Tensor, size: int) -> int:
 
 
 def _param_group(params, index: int, has_biases: bool):
-    # GRU keeps the same per-direction parameter layout as LSTM:
-    # [w_ih, w_hh, b_ih, b_hh] (4 params) or [w_ih, w_hh] (2 params).
-    # The gate count is 3, but the parameter count is unchanged.
+    # Per-direction layout is [w_ih, w_hh, b_ih, b_hh] / [w_ih, w_hh]: 4/2 params per
+    # state (same as LSTM) despite GRU's 3 gates.
     group_size = 4 if has_biases else 2
     base = index * group_size
     if has_biases:
@@ -855,25 +823,18 @@ def _store_hx_slice(src, dst, state_idx: int, batch_size: int, hidden_size: int)
 
 
 def _empty(shape, dtype, device):
-    # torch.empty under use_gems() dispatches to a Triton zero-fill kernel (~37us/launch
-    # vs ~2us for empty_strided); scratch buffers here are always written before read,
-    # so a plain caching-allocator allocation is safe and skips the launch.
     strides = [1] * len(shape)
     for i in range(len(shape) - 2, -1, -1):
         strides[i] = strides[i + 1] * shape[i + 1]
     return torch.empty_strided(shape, strides, dtype=dtype, device=device)
 
 
-# Cache of transposed (K, 3H) weights keyed by storage location. The input GEMM needs
-# the gate dim contiguous, so every call transposes the native (3H, K) weight; caching
-# removes two launches per direction on the launch-bound batch==1 path. The value holds
-# a strong ref to the source weight (data_ptr alone isn't unique across live/freed
-# storage), and _version invalidates entries mutated in place.
+# Transposed (K, 3H) weight cache (saves two transpose launches per direction). Values
+# keep a strong ref to the source (data_ptr isn't unique across freed storage).
 _transposed_weight_cache: dict = {}
 
 
 def _transpose_weight(weight: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-    """Return a contiguous (cols, rows) transposed copy of a (rows, cols) weight."""
     key = (
         weight.data_ptr(),
         weight.storage_offset(),
@@ -921,9 +882,7 @@ def _run_direction(
     batch_sizes=None,
 ):
     w_ih, w_hh, b_ih, b_hh = _param_group(params, param_idx, has_biases)
-    # Transpose so the gate (output) dim is contiguous: Triton's FFMA tl.dot is ~3x
-    # slower when B's N dim is strided (native (3H, K) loads uncoalesced, ~2.4 TFLOPS
-    # vs ~8 TFLOPS transposed to (K, 3H)).
+    # Transpose weights so the GEMM B (gate) dim is contiguous: a strided B costs ~3x on tl.dot.
     _validate_weight(w_ih, 3 * hidden_size, input_size)
     _validate_weight(w_hh, 3 * hidden_size, hidden_size)
     if w_ih.dim() == 1:
@@ -932,8 +891,7 @@ def _run_direction(
         w_hh = w_hh.view(3 * hidden_size, hidden_size)
     w_ih = _transpose_weight(w_ih, 3 * hidden_size, input_size)
     w_hh = _transpose_weight(w_hh, 3 * hidden_size, hidden_size)
-    # After transposition stride_r is the reduction-dim (K) row stride and stride_c
-    # is the gate-dim (N) column stride (= 1), the opposite of the native layout.
+    # Post-transpose: stride_r is the K (reduction) stride, stride_c the contiguous gate dim.
     w_ih_stride_r, w_ih_stride_c = w_ih.stride(0), w_ih.stride(1)
     w_hh_stride_r, w_hh_stride_c = w_hh.stride(0), w_hh.stride(1)
     b_ih_stride = _bias_stride(b_ih, 3 * hidden_size) if has_biases else 1
@@ -942,19 +900,14 @@ def _run_direction(
     if batch_size == 0:
         return
 
-    block_h = _block_size(hidden_size, _BLOCK_H_MAX)
+    block_h_step = _block_size(hidden_size, _STEP_BLOCK_H)
+    block_k_step = _block_size(hidden_size, _STEP_BLOCK_K)
     block_k_h = _block_size(hidden_size, _BLOCK_K_MAX)
     grid = (
         triton.cdiv(batch_size, _BLOCK_B),
-        triton.cdiv(hidden_size, block_h),
+        triton.cdiv(hidden_size, block_h_step),
     )
-    # The persistent (barrier) kernel folds the time loop into one launch; with only
-    # cdiv(hidden, 32) hidden tiles and a small batch its grid is 1-8 CTAs on a 78-SM
-    # GPU (~5% occupancy) and latency-bound. Halving the hidden tile doubles the CTAs,
-    # and shrinking the batch tile to the batch size avoids masked dot rows (BLOCK_B=8
-    # wastes half its MACs when batch=4). Only used when the finer grid is still
-    # co-resident (the grid-wide barrier deadlocks otherwise).
-    block_b_persist = min(_BLOCK_B, _ceil_power_of_2(batch_size))
+    block_b_persist = _BLOCK_B
     block_h_persist = _block_size(hidden_size, _BLOCK_H_MAX // 2)
     grid_persist = (
         triton.cdiv(batch_size, block_b_persist),
@@ -971,9 +924,8 @@ def _run_direction(
 
     max_persistent = _max_persistent_programs(layer_input.device)
 
-    # Precompute the input-side pre-activations for every timestep in one batched GEMM;
-    # the loop below then only does the hidden GEMM + gate combination. fp16/bf16 are
-    # accumulated (and kept) in fp32 here.
+    # Precompute input-side pre-activations for all timesteps in one batched GEMM
+    # (fp16/bf16 accumulate in fp32); the recurrence below only does the hidden GEMM.
     input_gates = _empty((seq_len, batch_size, 3 * hidden_size), gate_dtype, layer_input.device)
     input_gemm_grid = lambda META: (
         triton.cdiv(batch_size, META["BLOCK_B"]),
@@ -1005,17 +957,19 @@ def _run_direction(
             COMPUTE_DTYPE=compute_dtype,
         )
 
-        # Pick the recurrence kernel. The two barrier kernels (batch==1 GEMV and the
-        # grid-barrier persistent recurrence) hang unless every program is co-resident,
-        # so they are only taken when their grid <= max_persistent (== num_SMs, the
-        # provably co-resident bound); any shape that would exceed it falls through to
-        # the barrier-free per-step kernel.
+        # The barrier kernels need grid <= max_persistent to be co-resident, so any
+        # shape that overshoots it falls through to the barrier-free per-step kernel.
         block_k_g = _block_size(hidden_size, _GEMV_BLOCK_K_MAX)
         gemv_hoist = hidden_size <= block_k_g
         gemv_block_n = (
             _GEMV_HOIST_BLOCK_N if gemv_hoist else _block_size(hidden_size, _GEMV_BLOCK_N_MAX)
         )
         gemv_num_programs = triton.cdiv(hidden_size, gemv_block_n)
+        # Grow BLOCK_N (doubling, stays power-of-2) until the GEMV barrier grid fits the
+        # SM count: _GEMV_HOIST_BLOCK_N=2 targets 100+ SM parts and overshoots small ones.
+        while gemv_num_programs > max_persistent and gemv_block_n < hidden_size:
+            gemv_block_n *= 2
+            gemv_num_programs = triton.cdiv(hidden_size, gemv_block_n)
 
         use_gemv = batch_size == 1 and gemv_num_programs <= max_persistent
         use_persistent = (
@@ -1024,10 +978,7 @@ def _run_direction(
         )
 
         if use_gemv:
-            # batch==1: the hidden GEMM is a matrix-vector product, so a (batch, hidden)
-            # dot grid would idle the GPU (~6x slower than cuDNN). Use a persistent GEMV
-            # kernel that spreads hidden outputs across cdiv(hidden, BLOCK_N) programs.
-            # Only taken when gemv_num_programs <= max_persistent (grid co-resident).
+            # batch==1: spread hidden outputs across BLOCK_N per program (see _gru_gemv_kernel).
             h_buf = _empty((2, batch_size, hidden_size), hx.dtype, hx.device)
             _copy_hx_slice(hx, h_buf[0], state_idx, batch_size, hidden_size)
             barrier = torch.zeros(
@@ -1061,8 +1012,7 @@ def _run_direction(
             )
             final_h_state = h_buf[seq_len % 2]
         elif use_persistent:
-            # Fold the time loop into one kernel; only taken when the grid is co-resident
-            # (the barrier deadlocks otherwise), i.e. the launch-bound regime.
+            # Fold the time loop into one launch (the launch-bound regime); see _gru_persistent_kernel.
             h_buf = _empty((2, batch_size, hidden_size), hx.dtype, hx.device)
             # Copy the initial h into the double buffer (Tensor.copy_ would hit
             # FlagGems' copy_ override, which can't handle this view).
@@ -1130,10 +1080,12 @@ def _run_direction(
                     layer_output.stride(2),
                     HAS_BIAS=has_biases,
                     BLOCK_B=_BLOCK_B,
-                    BLOCK_H=block_h,
-                    BLOCK_K=block_k_h,
+                    BLOCK_H=block_h_step,
+                    BLOCK_K=block_k_step,
                     COMPUTE_DTYPE=compute_dtype,
                     PACKED=batch_sizes is not None,
+                    num_warps=_STEP_NUM_WARPS,
+                    num_stages=_STEP_NUM_STAGES,
                 )
                 h_work, h_next = h_next, h_work
             final_h_state = h_work
@@ -1190,12 +1142,6 @@ def _gru_forward_impl(
     dropout,
     batch_sizes=None,
 ):
-    """Core GRU forward writing into caller-provided ``output`` and ``final_h``.
-
-    ``output`` must be a contiguous, time-first tensor of shape
-    ``(seq_len, batch_size, hidden_size * num_directions)``. The last layer is
-    written directly into it to avoid an extra copy into a separate buffer.
-    """
     layer_input = input_view
     for layer in range(num_layers):
         layer_input_size = input_size if layer == 0 else hidden_size * num_directions
@@ -1246,13 +1192,6 @@ def gru(
     bidirectional=False,
     batch_first=False,
 ):
-    """Forward pass of a GRU matching the ``aten::gru.input`` schema.
-
-    Signature mirrors ``torch.gru`` / ``torch.nn.GRU`` exactly: hx is a single
-    hidden-state tensor and the function returns ``(output, h_n)``. This is a
-    forward-only implementation (no autograd.Function); training through it is
-    not supported, same as lstm.py.
-    """
     logger.debug("GEMS GRU")
     _validate_args(input, hx, params, has_biases, num_layers, dropout, bidirectional)
 
@@ -1310,17 +1249,7 @@ def gru_data(
     train=False,
     bidirectional=False,
 ):
-    """Forward pass of a GRU over a packed variable-length sequence, matching the
-    ``aten::gru.data`` schema.
-
-    ``data`` is the packed input of shape ``(sum(batch_sizes), input_size)`` and
-    ``batch_sizes`` the non-increasing per-timestep batch count produced by
-    ``torch.nn.utils.rnn.pack_padded_sequence``. At each timestep only the first
-    ``batch_sizes[t]`` rows advance; rows whose sequence has already ended keep their
-    previous hidden value. Returns the packed ``(sum(batch_sizes), hidden_size)``
-    output and the ``(num_layers, batch, hidden_size)`` final hidden state.
-    """
-    logger.debug("GEMS GRU (data)")
+    logger.debug("GEMS GRU_DATA")
     if bidirectional:
         raise NotImplementedError(
             "FlagGems gru.data does not support bidirectional packed sequences yet"
@@ -1363,9 +1292,8 @@ def gru_data(
     # the data's device. Move it here (no-op when already resident).
     batch_sizes = batch_sizes.to(data.device)
 
-    # Exclusive prefix-sum of batch_sizes (plus an int32 copy for the recurrence
-    # mask), computed by a dedicated kernel. Avoids torch.cumsum/sub dispatch under
-    # use_gems(), whose integer handling crashes on the packed path.
+    # Exclusive prefix-sum of batch_sizes (plus an int32 copy for the recurrence mask)
+    # via a kernel, avoiding torch.cumsum/sub dispatch (crashes on packed input).
     offsets = _empty((num_steps,), torch.int32, data.device)
     bs32 = _empty((num_steps,), torch.int32, data.device)
     with torch_device_fn.device(data.device):

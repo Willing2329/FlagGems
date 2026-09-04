@@ -1,17 +1,3 @@
-# Copyright 2027 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import logging
 import types
 
@@ -20,6 +6,8 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops.gru import (
+    _PACK_BLOCK,
+    _batch_offsets_kernel,
     _bias_stride,
     _block_size,
     _ceil_power_of_2,
@@ -29,28 +17,19 @@ from flag_gems.ops.gru import (
     _gru_gemv_kernel,
     _gru_input_gemm_kernel as _generic_input_gemm,
     _max_persistent_programs,
+    _pack_output_kernel,
     _param_group,
     _store_hx_slice,
     _transpose_weight,
+    _unpack_padded_kernel,
+    _validate_args,
     _validate_weight,
-    gru as _generic_gru,
-    gru_data as _generic_gru_data,
 )
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 
 logger = logging.getLogger(__name__)
 
-# MetaX GRU override of flag_gems/ops/gru.py: the flagtree triton fork
-# miscompiles tl.dot (fp64 garbage, flaky pipelined fp32) and its AABS
-# autotuner can shrink BLOCK_K below the dot's K >= 16 minimum. Workarounds:
-# NO_DOT FMA kernels for fp64, num_stages=1 + BLOCK_H=16 (32 if hidden >=
-# 1024) for the fp32 recurrence, and a dot-free input GEMM for fp64 and
-# input_size <= 8. Everything else is imported from the generic file; the
-# remaining behavioral divergences (validated on C550) are the autotuned
-# input GEMM (8-22% faster than the generic's fixed tile) and the pow2(batch)
-# persistent-batch shrink (the generic's fixed tile miscompiles on small
-# batch).
 
 _BLOCK_B = 16
 _BLOCK_H_MAX = 32
@@ -73,8 +52,7 @@ def _fma_block_k(size: int, cap: int) -> int:
     return min(cap, max(8, _ceil_power_of_2(size)))
 
 
-# The generic input GEMM kernel body is identical; re-wrap it with the metax
-# autotune configs (kept over the generic's fixed tile, see the header).
+# Re-wrap the (identical) generic input GEMM kernel with the autotune configs above.
 _gru_input_gemm_kernel = libentry()(
     triton.autotune(
         _GRU_INPUT_GEMM_CONFIGS,
@@ -110,8 +88,6 @@ def _gru_input_gemm_fma_kernel(
     BLOCK_K: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
 ):
-    # Dot-free input GEMM: fp64 tl.dot is broken, and for input_size <= 8 the
-    # autotuner can shrink BLOCK_K below the dot's K >= 16 minimum.
     pid_b = tl.program_id(0)
     seq_idx = tl.program_id(1)
     pid_n = tl.program_id(2)
@@ -198,8 +174,6 @@ def _gru_step_kernel(
     PACKED: tl.constexpr,
     NO_DOT: tl.constexpr = False,
 ):
-    # One recurrence step; NO_DOT switches the hidden GEMM to element-wise
-    # FMA (fp64 tl.dot is broken on the toolchain).
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -493,8 +467,6 @@ def _run_direction(
         return
 
     block_k_h = _block_size(hidden_size, _BLOCK_K_MAX)
-    # pow2(batch) shrink over the generic's fixed _BLOCK_B: the fixed tile
-    # miscompiles on small batch.
     block_b_persist = min(_BLOCK_B, _ceil_power_of_2(batch_size))
     block_h_persist = _block_size(hidden_size, _BLOCK_H_MAX // 2)
     grid_persist = (
@@ -673,8 +645,6 @@ def _run_direction(
             )
             final_h_state = h_buf[seq_len % 2]
         else:
-            # num_stages=1 + BLOCK_H=16 avoid the pipeliner miscompile; fp64
-            # uses a narrow batch tile with a wide K chunk.
             if no_dot_recur:
                 step_block_b, step_block_h = 4, 16
                 step_block_k = _fma_block_k(hidden_size, 256)
@@ -730,9 +700,8 @@ def _run_direction(
 
 
 def _rehome(fn, **overrides):
-    # Copy a generic-module function with selected globals bound to this
-    # module, so the entry chain calls the metax _run_direction without
-    # mutating the generic module.
+    # Rebind a generic-module function's globals so the entry chain calls the metax
+    # _run_direction without mutating the generic module.
     g = dict(fn.__globals__)
     g.update(overrides)
     f = types.FunctionType(fn.__code__, g, fn.__name__, fn.__defaults__, fn.__closure__)
@@ -741,7 +710,191 @@ def _rehome(fn, **overrides):
 
 
 _gru_forward_impl = _rehome(_generic_gru_forward_impl, _run_direction=_run_direction)
-gru = _rehome(_generic_gru, _gru_forward_impl=_gru_forward_impl, logger=logger)
-gru_data = _rehome(_generic_gru_data, _gru_forward_impl=_gru_forward_impl, logger=logger)
 
-del _generic_gru, _generic_gru_data, _generic_gru_forward_impl, _generic_input_gemm, _rehome
+# Local copies of the generic gru/gru_data entries; only the debug marker differs so the
+# log shows which backend ran. Keep in sync with the entry bodies in flag_gems/ops/gru.py.
+
+
+def gru(
+    input,
+    hx,
+    params,
+    has_biases=True,
+    num_layers=1,
+    dropout=0.0,
+    train=False,
+    bidirectional=False,
+    batch_first=False,
+):
+    logger.debug("GEMS_METAX GRU")
+    _validate_args(input, hx, params, has_biases, num_layers, dropout, bidirectional)
+
+    if batch_first:
+        batch_size, seq_len, input_size = input.shape
+        input_view = input.transpose(0, 1)
+    else:
+        seq_len, batch_size, input_size = input.shape
+        input_view = input
+    if seq_len == 0:
+        raise RuntimeError("Expected sequence length to be larger than 0 in RNN")
+
+    hidden_size = hx.shape[2]
+    num_directions = 2 if bidirectional else 1
+
+    final_h = _empty(
+        (num_layers * num_directions, batch_size, hidden_size),
+        input.dtype,
+        input.device,
+    )
+    output_tf = _empty(
+        (seq_len, batch_size, hidden_size * num_directions),
+        input.dtype,
+        input.device,
+    )
+    _gru_forward_impl(
+        input_view,
+        hx,
+        params,
+        output_tf,
+        final_h,
+        num_layers,
+        num_directions,
+        hidden_size,
+        input_size,
+        batch_size,
+        seq_len,
+        has_biases,
+        train,
+        dropout,
+    )
+
+    output = output_tf.transpose(0, 1) if batch_first else output_tf
+    return output, final_h
+
+
+def gru_data(
+    data,
+    batch_sizes,
+    hx,
+    params,
+    has_biases=True,
+    num_layers=1,
+    dropout=0.0,
+    train=False,
+    bidirectional=False,
+):
+    logger.debug("GEMS_METAX GRU_DATA")
+    if bidirectional:
+        raise NotImplementedError(
+            "FlagGems gru.data does not support bidirectional packed sequences yet"
+        )
+    if data.dim() != 2:
+        raise RuntimeError("gru.data: packed data must have 2 dimensions")
+    if batch_sizes.dim() != 1:
+        raise RuntimeError("gru.data: batch_sizes must be 1-dimensional")
+    if num_layers <= 0:
+        raise RuntimeError("gru.data: num_layers must be greater than zero")
+    if not 0.0 <= dropout <= 1.0:
+        raise RuntimeError("gru.data: dropout probability must be between 0 and 1")
+    if data.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise NotImplementedError(
+            "FlagGems gru.data supports float16, bfloat16, float32, and float64"
+        )
+    if hx.dim() != 3:
+        raise RuntimeError("gru.data: hidden state must have 3 dimensions")
+    if hx.shape[0] != num_layers:
+        raise RuntimeError(
+            f"gru.data: expected {num_layers} hidden state rows, got {hx.shape[0]}"
+        )
+    expected_params = num_layers * (4 if has_biases else 2)
+    if len(params) != expected_params:
+        raise RuntimeError(
+            f"gru.data: expected {expected_params} parameter tensors, got {len(params)}"
+        )
+    if hx.device != data.device:
+        raise RuntimeError("gru.data: data and hidden state must share a device")
+    if hx.dtype != data.dtype:
+        raise RuntimeError("gru.data: data and hidden state must share a dtype")
+
+    num_steps = batch_sizes.numel()
+    input_size = data.shape[1]
+    batch = hx.shape[1]
+    hidden_size = hx.shape[2]
+    num_directions = 1
+
+    # pack_padded_sequence produces batch_sizes on CPU; the kernels below need it on
+    # the data's device. Move it here (no-op when already resident).
+    batch_sizes = batch_sizes.to(data.device)
+
+    # Exclusive prefix-sum of batch_sizes (plus an int32 copy for the recurrence mask)
+    # via a kernel, avoiding torch.cumsum/sub dispatch (crashes on packed input).
+    offsets = _empty((num_steps,), torch.int32, data.device)
+    bs32 = _empty((num_steps,), torch.int32, data.device)
+    with torch_device_fn.device(data.device):
+        _batch_offsets_kernel[(1,)](
+            batch_sizes,
+            offsets,
+            bs32,
+            num_steps,
+            BLOCK=_ceil_power_of_2(num_steps),
+        )
+
+    # Gather the packed input into a zero-padded (num_steps, batch, input) tensor so
+    # the existing batched recurrence can be reused unchanged; padding rows are zeros.
+    x_padded = _empty((num_steps, batch, input_size), data.dtype, data.device)
+    with torch_device_fn.device(data.device):
+        _unpack_padded_kernel[(num_steps * batch,)](
+            data,
+            x_padded,
+            offsets,
+            bs32,
+            input_size,
+            batch,
+            data.stride(0),
+            x_padded.stride(0),
+            x_padded.stride(1),
+            x_padded.stride(2),
+            BLOCK_F=_PACK_BLOCK,
+        )
+
+    final_h = _empty((num_layers, batch, hidden_size), data.dtype, data.device)
+    out_padded = _empty((num_steps, batch, hidden_size), data.dtype, data.device)
+    _gru_forward_impl(
+        x_padded,
+        hx,
+        params,
+        out_padded,
+        final_h,
+        num_layers,
+        num_directions,
+        hidden_size,
+        input_size,
+        batch,
+        num_steps,
+        has_biases,
+        train,
+        dropout,
+        batch_sizes=bs32,
+    )
+
+    # Pack the padded output back into the (sum(batch_sizes), hidden) layout.
+    out_packed = _empty((data.shape[0], hidden_size), data.dtype, data.device)
+    with torch_device_fn.device(data.device):
+        _pack_output_kernel[(num_steps * batch,)](
+            out_padded,
+            out_packed,
+            offsets,
+            bs32,
+            hidden_size,
+            batch,
+            out_padded.stride(0),
+            out_padded.stride(1),
+            out_padded.stride(2),
+            out_packed.stride(0),
+            BLOCK_F=_PACK_BLOCK,
+        )
+
+    return out_packed, final_h
+
+
+del _generic_gru_forward_impl, _generic_input_gemm, _rehome

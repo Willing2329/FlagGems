@@ -4239,6 +4239,30 @@ ops:
       - MoE
     stages:
       - stable: '5.0'
+  - id: gru
+    description: |
+      Gated recurrent unit (GRU). At each time step, computes a new hidden state
+      from the input and the previous hidden state using a reset gate and an update
+      gate, across one or more layers and optionally bidirectionally. 
+    for:
+      - aten.gru
+    labels:
+      - aten
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.4'
+  - id: gru_data
+    description: |
+      Gated recurrent unit (GRU) over packed-sequence data.
+    for:
+      - aten.gru.data
+    labels:
+      - aten
+    kind:
+      - NeuralNetwork
+    stages:
+      - beta: '5.4'
   - id: gt
     description: Computes that `input` is greater than `other` element-wise.
     for:
