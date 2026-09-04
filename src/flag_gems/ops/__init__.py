@@ -445,6 +445,7 @@ from flag_gems.ops.grid_sample import grid_sample
 from flag_gems.ops.grid_sampler_3d_backward import grid_sampler_3d_backward
 from flag_gems.ops.group_gemm import group_mm
 from flag_gems.ops.groupnorm import group_norm, group_norm_backward
+from flag_gems.ops.gru import gru, gru_data
 from flag_gems.ops.gt import gt, gt_scalar, gt_scalar_, gt_tensor_
 from flag_gems.ops.hadamard_transform import (
     hadamard_transform,
@@ -1404,6 +1405,8 @@ __all__ = [
     "group_mm",
     "group_norm",
     "group_norm_backward",
+    "gru",
+    "gru_data",
     "gt",
     "gt_scalar",
     "gt_scalar_",

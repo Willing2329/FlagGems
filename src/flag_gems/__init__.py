@@ -628,6 +628,8 @@ _FULL_CONFIG = (
     ("greater_equal_.Tensor", greater_equal_),
     ("grid_sample", grid_sample),
     ("grid_sampler_3d_backward", grid_sampler_3d_backward),
+    ("gru.data", gru_data),
+    ("gru.input", gru),
     ("gt.Scalar", gt_scalar),
     ("gt.Tensor", gt),
     ("gt_.Scalar", gt_scalar_),
