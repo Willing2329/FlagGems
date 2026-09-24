@@ -354,7 +354,7 @@ def linear(input, weight, bias=None):
     Returns:
         Output tensor of shape (*, out_features)
     """
-    logger.debug("GEMS LINEAR")
+    logger.debug("GEMS_THEAD LINEAR")
 
     if input.dim() == 1:
         input = input.unsqueeze(0)
