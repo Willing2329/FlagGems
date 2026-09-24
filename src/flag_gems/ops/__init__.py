@@ -314,6 +314,7 @@ from flag_gems.ops.avg_pool3d import avg_pool3d, avg_pool3d_backward
 from flag_gems.ops.baddbmm import baddbmm, baddbmm_out
 from flag_gems.ops.baddbmm_ import baddbmm_
 from flag_gems.ops.batch_norm import batch_norm, batch_norm_backward
+from flag_gems.ops.batch_norm_backward_elemt import batch_norm_backward_elemt
 from flag_gems.ops.batch_norm_backward_reduce import batch_norm_backward_reduce
 from flag_gems.ops.batch_norm_gather_stats import batch_norm_gather_stats
 from flag_gems.ops.batch_norm_gather_stats_with_counts import (
@@ -608,6 +609,7 @@ from flag_gems.ops.hinge_embedding_loss import hinge_embedding_loss
 from flag_gems.ops.histc import histc
 from flag_gems.ops.histogramdd import histogramdd
 from flag_gems.ops.hsplit import hsplit
+from flag_gems.ops.hspmm import hspmm
 from flag_gems.ops.hstack import hstack
 from flag_gems.ops.huber_loss import huber_loss, huber_loss_out
 from flag_gems.ops.hypot import hypot, hypot_out
@@ -630,6 +632,7 @@ from flag_gems.ops.index_select_backward import index_select_backward
 from flag_gems.ops.inner import inner
 from flag_gems.ops.int_mm import int_mm, int_mm_out
 from flag_gems.ops.inverse import inverse
+from flag_gems.ops.ior_scalar import ior_scalar
 from flag_gems.ops.is_nonzero import is_nonzero
 from flag_gems.ops.is_same_size import is_same_size
 from flag_gems.ops.isclose import allclose, isclose
@@ -640,6 +643,11 @@ from flag_gems.ops.isnan import isnan
 from flag_gems.ops.isneginf import isneginf, isneginf_out
 from flag_gems.ops.isposinf import isposinf
 from flag_gems.ops.isreal import isreal
+from flag_gems.ops.kaiser_window import (
+    kaiser_window,
+    kaiser_window_beta,
+    kaiser_window_periodic,
+)
 from flag_gems.ops.kron import kron
 from flag_gems.ops.kthvalue import kthvalue
 from flag_gems.ops.layernorm import layer_norm, layer_norm_backward
@@ -671,6 +679,7 @@ from flag_gems.ops.linalg_det import linalg_det, linalg_det_out
 from flag_gems.ops.linalg_eig import linalg_eig
 from flag_gems.ops.linalg_eigvals import linalg_eigvals, linalg_eigvals_out
 from flag_gems.ops.linalg_householder_product import linalg_householder_product
+from flag_gems.ops.linalg_inv_ex import linalg_inv_ex
 from flag_gems.ops.linalg_ldl_factor import ldl_factor
 from flag_gems.ops.linalg_ldl_solve import linalg_ldl_solve
 from flag_gems.ops.linalg_lstsq import linalg_lstsq
@@ -896,7 +905,12 @@ from flag_gems.ops.pow import (
 )
 from flag_gems.ops.prelu import prelu
 from flag_gems.ops.prod import prod, prod_dim
+from flag_gems.ops.put import put, put_out
 from flag_gems.ops.quantile import quantile
+from flag_gems.ops.quantize_per_tensor import (
+    quantize_per_tensor,
+    quantize_per_tensor_out,
+)
 from flag_gems.ops.quantized_gru import (
     quantized_gru_data,
     quantized_gru_impl,
@@ -964,6 +978,7 @@ from flag_gems.ops.roll import roll
 from flag_gems.ops.rot90 import rot90
 from flag_gems.ops.round import round, round_, round_out
 from flag_gems.ops.row_indices import row_indices
+from flag_gems.ops.row_indices_copy import row_indices_copy, row_indices_copy_out
 from flag_gems.ops.row_stack import row_stack, row_stack_out
 from flag_gems.ops.rrelu_with_noise import rrelu_with_noise, rrelu_with_noise_
 from flag_gems.ops.rrelu_with_noise_backward import rrelu_with_noise_backward
@@ -1548,6 +1563,7 @@ __all__ = [
     "baddbmm_out",
     "batch_norm",
     "batch_norm_backward",
+    "batch_norm_backward_elemt",
     "batch_norm_backward_reduce",
     "batch_norm_gather_stats",
     "batch_norm_gather_stats_with_counts",
@@ -1863,6 +1879,7 @@ __all__ = [
     "histc",
     "histogramdd",
     "hsplit",
+    "hspmm",
     "hstack",
     "huber_loss",
     "huber_loss_out",
@@ -1896,6 +1913,7 @@ __all__ = [
     "int_mm",
     "int_mm_out",
     "inverse",
+    "ior_scalar",
     "is_nonzero",
     "is_same_size",
     "isclose",
@@ -1907,6 +1925,9 @@ __all__ = [
     "isneginf_out",
     "isposinf",
     "isreal",
+    "kaiser_window",
+    "kaiser_window_beta",
+    "kaiser_window_periodic",
     "kron",
     "kthvalue",
     "layer_norm",
@@ -1955,6 +1976,7 @@ __all__ = [
     "linalg_eigvals",
     "linalg_eigvals_out",
     "linalg_householder_product",
+    "linalg_inv_ex",
     "linalg_ldl_solve",
     "linalg_lstsq",
     "linalg_lu",
@@ -2197,7 +2219,11 @@ __all__ = [
     "prelu",
     "prod",
     "prod_dim",
+    "put",
+    "put_out",
     "quantile",
+    "quantize_per_tensor",
+    "quantize_per_tensor_out",
     "quantized_gru_data",
     "quantized_gru_impl",
     "quantized_gru_input",
@@ -2272,6 +2298,8 @@ __all__ = [
     "round_out",
     "router_gemm",
     "row_indices",
+    "row_indices_copy",
+    "row_indices_copy_out",
     "row_stack",
     "row_stack_out",
     "rrelu_with_noise",
